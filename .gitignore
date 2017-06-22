@@ -1,0 +1,7 @@
+*.o
+*.csv
+
+*.so
+.DS_Store
+._.DS_Store
+*.tgz
