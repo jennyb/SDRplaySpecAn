@@ -43,10 +43,22 @@
 
 #define MAGNITUDE(z) sqrt(z.re * z.re + z.im * z.im)
 
+typedef struct {
+    int gRdB;
+    double fsMHz;
+    double rfMHz;
+    mir_sdr_Bw_MHzT bwType;
+    mir_sdr_If_kHzT ifType;
+    int LNAstate;
+    mir_sdr_SetGrModeT setGrMode;
+} SDR_CONFIG;
+
 typedef bool (*CallbackFn)(double *levels);
 
 typedef struct {
     int mb;
+    SDR_CONFIG *sdr;
+    bool changed;
     struct GPU_FFT *fft;
     struct GPU_FFT_COMPLEX *buffer;
     int pos;
@@ -58,7 +70,7 @@ typedef struct {
 } CB_CONTEXT;
 
 // initialise callback context including RAM for IQ samples
-int initCbContext(CB_CONTEXT *cbContext, CallbackFn callback)
+int initCbContext(CB_CONTEXT *cbContext, SDR_CONFIG *sdr, CallbackFn callback)
 {
     cbContext->mb = mbox_open();
         
@@ -71,6 +83,8 @@ int initCbContext(CB_CONTEXT *cbContext, CallbackFn callback)
         case -5: fprintf(stderr, "Can't open libbcm_host.\n");                                         return -1;
     }
 
+    cbContext->sdr = sdr;
+    cbContext->changed = false;
     cbContext->buffer = calloc(MAXIMAL_BUF_LENGTH, sizeof(struct GPU_FFT_COMPLEX));
     cbContext->pos = 0;
     cbContext->fn = callback;
@@ -96,8 +110,8 @@ void processBuffer(CB_CONTEXT *cbContext)
     for (int i = 0; i < FFT_SIZE; i++) {
         double bhtmp1 = (double)(2 * 3.1415 * i / FFT_SIZE);
         double bhtmp2 = (double)(0.35875 - (0.48829*cos(bhtmp1)) + (0.14128 * cos(2*bhtmp1)) - (0.01168*cos(3*bhtmp1)));
-        cbContext->fft->in[i].re = cbContext->buffer[i].re * bhtmp2;                 
-        cbContext->fft->in[i].im = cbContext->buffer[i].im * bhtmp2;
+        cbContext->fft->in[i].re = cbContext->buffer[i].re;// * bhtmp2;                 
+        cbContext->fft->in[i].im = cbContext->buffer[i].im;// * bhtmp2;
     }
     
     gpu_fft_execute(cbContext->fft);
@@ -120,7 +134,7 @@ void processBuffer(CB_CONTEXT *cbContext)
 
 void gainCallback(unsigned int gRdB, unsigned int lnaGRdB, void *cbContext)
 {
-    return;
+    fprintf(stderr, "gainCallback: gRdB=%u, lnaGRdB=%u\n", gRdB, lnaGRdB);
 }
 
 void streamCallback(short *xi, short *xq, unsigned int firstSampleNum,
@@ -137,8 +151,53 @@ void streamCallback(short *xi, short *xq, unsigned int firstSampleNum,
             cbContext->pos = 0;
         }
     }
+
+    mir_sdr_GainValuesT gains;
+    mir_sdr_GetCurrentGain(&gains);
+
+    mir_sdr_BandT band;
+    int gRdB = -SET_POINT;
+    int LNAstate = RSP_LNA;
+    int gRdBsystem;
+    mir_sdr_GetGrByFreq(cbContext->sdr->rfMHz, &band, &gRdB, LNAstate, &gRdBsystem, mir_sdr_USE_SET_GR_ALT_MODE);
+
+    fprintf(stderr, "firstSampleNum=%d grChanged=%d rfChanged=%d fsChanged=%d reset=%d gain=%f\n", firstSampleNum, grChanged, rfChanged, fsChanged, reset, gains.curr);
+    fprintf(stderr, "band=%d gRdB=%d gRdBsystem=%d\n", band, gRdB, gRdBsystem);
+
+    if (grChanged > 0) fprintf(stderr, "==== gain reduction changed\n");
+    if (rfChanged > 0) fprintf(stderr, "---- frequency changed\n");
+
+    if (firstSampleNum > 12819746 && ! cbContext->changed) {
+        cbContext->changed = true;
+        SDR_CONFIG *sdr = cbContext->sdr;
+        sdr->rfMHz += 2;
+        int gRdBsystem;
+        int samplesPerPacket;
+        int r = mir_sdr_Reinit(&sdr->gRdB, sdr->fsMHz, sdr->rfMHz,
+            sdr->bwType, sdr->ifType, mir_sdr_LO_Undefined, sdr->LNAstate, &gRdBsystem,
+            sdr->setGrMode, &samplesPerPacket, mir_sdr_CHANGE_RF_FREQ) == mir_sdr_Success ? 0 : 1;
+        //fprintf(stderr, "freq change? %d\n", mir_sdr_SetRf(2e6, 0, 0));
+        fprintf(stderr, "freq change? %d     gRdBsystem=%d\n", r, gRdBsystem);
+    }
 }
 
+/*18 81
+21 78
+21 78
+24 75
+25 74
+27 72
+30 69
+30 69
+36 63
+43 56
+50 49
+57 42
+64 44 ?
+70 38 ?*/
+
+
+// initialise SDRPlay device - return -1 on error, device model (>=0) on success
 int initDevice(int deviceArg, int antenna) {
     mir_sdr_DeviceT devices[4];
     unsigned int numDevs;
@@ -146,7 +205,7 @@ int initDevice(int deviceArg, int antenna) {
 
     if (antenna < 0 || antenna > 2) {
         fprintf(stderr, "ERROR: antenna value not supported (0 = Ant A, 1 = Ant B, 2 = HiZ)z\n");
-        return -1;
+        return 1;
     }
 
     mir_sdr_GetDevices(&devices[0], &numDevs, 4);
@@ -160,12 +219,12 @@ int initDevice(int deviceArg, int antenna) {
 
     if (devAvail == 0) {
         fprintf(stderr, "ERROR: No RSP devices available.\n");
-        return -1;
+        return 1;
     }
 
     if (devices[device].devAvail != 1) {
         fprintf(stderr, "ERROR: RSP selected (%d) is not available.\n", (device + 1));
-        return -1;
+        return 1;
     }
 
     mir_sdr_SetDeviceIdx(device);
@@ -175,13 +234,11 @@ int initDevice(int deviceArg, int antenna) {
     mir_sdr_SetPpm(PPM_OFFSET);
 
     if (devModel == 2) {
-        if (antenna == 1) {
+        if (antenna == 0) {
             mir_sdr_RSPII_AntennaControl(mir_sdr_RSPII_ANTENNA_A);
-        } else {
+        } else if (antenna == 1) {
             mir_sdr_RSPII_AntennaControl(mir_sdr_RSPII_ANTENNA_B);
-        }
-
-        if (antenna == 2) {
+        } else {
             mir_sdr_AmPortSelect(1);
         }
     }
@@ -189,36 +246,14 @@ int initDevice(int deviceArg, int antenna) {
     return devModel;
 }
 
-bool check_bw(int bwkHz) {
-    switch (bwkHz) {
-        case 200:
-        case 300:
-        case 600:
-        case 1536:
-        case 5000:
-        case 6000:
-        case 7000:
-        case 8000:
-            return true;
-        default:
-            return false;
-    }
-}
-
 unsigned int fft_size() {
     return FFT_SIZE;
 }
 
-int sdr_main(int antenna, int bwkHz, int device, uint32_t frequency, uint32_t samp_rate, CallbackFn callback, int verbose) {
-    int gainR = 50;
+// start a streaming thread, calling the callback; wait for it to complete. return number of samples per packet
+int sdr_main(int antenna, int gainR, int bwType, int device, double rfMHz, double fsMHz, CallbackFn callback, int verbose) {
     int gRdBsystem;
     int samplesPerPacket;
-
-    if (! check_bw(bwkHz)) {
-        fprintf(stderr, "ERROR: IF bandwidth (%d kHz) not valid.\n", bwkHz);
-        fprintf(stderr, "Valid values: 200, 300, 600, 1536, 5000, 6000, 7000, 8000\n\n");
-        return -1;
-    }
 
     if (verbose > 0) {
         mir_sdr_DebugEnable(1);
@@ -229,16 +264,28 @@ int sdr_main(int antenna, int bwkHz, int device, uint32_t frequency, uint32_t sa
         return -1;
     }
 
+    //FIXME use this as input argument type, initialised therefore in Python
+    SDR_CONFIG sdr;
+    sdr.gRdB = gainR;
+    sdr.fsMHz = fsMHz;
+    sdr.rfMHz = rfMHz;
+    sdr.bwType = (mir_sdr_Bw_MHzT)bwType;
+    sdr.ifType = (mir_sdr_If_kHzT)IF_KHZ;
+    sdr.LNAstate = RSP_LNA;
+    sdr.setGrMode = mir_sdr_USE_SET_GR_ALT_MODE;
+
     CB_CONTEXT cbContext;
-    int r = initCbContext(&cbContext, callback);
+    int r = initCbContext(&cbContext, &sdr, callback);
     if (r == 0) {
-        r = mir_sdr_StreamInit(&gainR, (samp_rate/1e6), (frequency/1e6),
-            (mir_sdr_Bw_MHzT)bwkHz, (mir_sdr_If_kHzT)IF_KHZ, RSP_LNA, &gRdBsystem,
-            mir_sdr_USE_SET_GR_ALT_MODE, &samplesPerPacket, streamCallback,
+        r = mir_sdr_StreamInit(&sdr.gRdB, sdr.fsMHz, sdr.rfMHz,
+            sdr.bwType, sdr.ifType, sdr.LNAstate, &gRdBsystem,
+            sdr.setGrMode, &samplesPerPacket, streamCallback,
             gainCallback, &cbContext) == mir_sdr_Success ? 0 : 1;
 
         if (r == 0) {
-            mir_sdr_AgcControl(AGC_CONTROL, SET_POINT, 0, 0, 0, 0, RSP_LNA);
+            fprintf(stderr, "gRdBsystem=%d\n", gRdBsystem);
+
+            mir_sdr_AgcControl(AGC_CONTROL, SET_POINT, 0, 0, 0, 0, sdr.LNAstate);
 
             if (devModel == 2) {
                 mir_sdr_RSPII_ExternalReferenceControl(0);
@@ -263,5 +310,5 @@ int sdr_main(int antenna, int bwkHz, int device, uint32_t frequency, uint32_t sa
 
     mir_sdr_ReleaseDeviceIdx();
 
-    return r;
+    return r == 0 ? samplesPerPacket : -r;
 }
