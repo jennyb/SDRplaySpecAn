@@ -31,17 +31,10 @@
 #include "gpu_fft.h"
 #include "mirsdrapi-rsp.h"
 
-#define MAXIMAL_BUF_LENGTH  (256 * 16384)
-#define FFT_SIZE            4096  // FFT size
-#define LOG2_N              12    // FFT length
-
-#define RSP_LNA             0
-#define IF_KHZ              0
-#define SET_POINT           -30
-#define PPM_OFFSET          0.0f
-#define AGC_CONTROL         1
-
 #define MAGNITUDE(z) sqrt(z.re * z.re + z.im * z.im)
+
+unsigned int fftSize = 4096;
+unsigned int log2_fftSize = 12;
 
 typedef struct {
     int gRdB;
@@ -49,153 +42,138 @@ typedef struct {
     double rfMHz;
     mir_sdr_Bw_MHzT bwType;
     mir_sdr_If_kHzT ifType;
-    int LNAstate;
+    double ppmOffset;
     mir_sdr_SetGrModeT setGrMode;
+    mir_sdr_AgcControlT agcControl;
+    int setPoint_dBfs;
+    int lnaState;
 } SDR_CONFIG;
 
-typedef bool (*CallbackFn)(double *levels);
+typedef enum {
+    PlayLib_CONTINUE = 0,
+    PlayLib_REINIT   = 1,
+    PlayLib_EXIT     = 2
+} CallbackReturnT;
+
+typedef CallbackReturnT (*CallbackFn)(mir_sdr_GainValuesT *gains, double *levels);
 
 typedef struct {
-    int mb;
-    SDR_CONFIG *sdr;
-    bool changed;
-    struct GPU_FFT *fft;
-    struct GPU_FFT_COMPLEX *buffer;
-    int pos;
-    double levels[FFT_SIZE];
+    SDR_CONFIG *sdr;                // pointer to SDR config struct passed in to sdr_main()
+    bool bhWindow;                  // whether to apply the Blackman-Harris window
+
+    int mb;                         // 'mailbox' handle used by GPU FFT
+    struct GPU_FFT *fft;            // input/output for GPU FFT
+    unsigned int pos;               // current position into fft->in
+
     CallbackFn fn;
-    bool do_exit;
+    mir_sdr_GainValuesT gains;
+    int action;
+    double *levels;
     pthread_mutex_t mutex;
     pthread_cond_t cv;
+
+    int gRdBsystem;
+    int samplesPerPacket;
+    int init_r;
 } CB_CONTEXT;
 
 // initialise callback context including RAM for IQ samples
-int initCbContext(CB_CONTEXT *cbContext, SDR_CONFIG *sdr, CallbackFn callback)
-{
+int initCbContext(CB_CONTEXT *cbContext, SDR_CONFIG *sdr, bool bhWindow, CallbackFn callback) {
     cbContext->mb = mbox_open();
         
-    int ret = gpu_fft_prepare(cbContext->mb, LOG2_N, GPU_FFT_FWD, 1, &cbContext->fft);
+    int ret = gpu_fft_prepare(cbContext->mb, log2_fftSize, GPU_FFT_FWD, 1, &cbContext->fft);
     switch (ret) {
         case -1: fprintf(stderr, "Unable to enable V3D. Please check your firmware is up to date.\n"); return -1;
-        case -2: fprintf(stderr, "log2_N=%d not supported.  Try between 8 and 22.\n", LOG2_N);         return -1;
+        case -2: fprintf(stderr, "log2_N=%d not supported.  Try between 8 and 22.\n", log2_fftSize);   return -1;
         case -3: fprintf(stderr, "Out of memory.  Try a smaller batch or increase GPU memory.\n");     return -1;
         case -4: fprintf(stderr, "Unable to map Videocore peripherals into ARM memory space.\n");      return -1;
         case -5: fprintf(stderr, "Can't open libbcm_host.\n");                                         return -1;
     }
 
     cbContext->sdr = sdr;
-    cbContext->changed = false;
-    cbContext->buffer = calloc(MAXIMAL_BUF_LENGTH, sizeof(struct GPU_FFT_COMPLEX));
+    cbContext->bhWindow = bhWindow;
     cbContext->pos = 0;
     cbContext->fn = callback;
-    cbContext->do_exit = false;
+    cbContext->action = PlayLib_CONTINUE;
+    cbContext->levels = calloc(fftSize, sizeof(double));
     pthread_mutex_init(&cbContext->mutex, NULL);
     pthread_cond_init(&cbContext->cv, NULL);
 
     return 0;
 }
 
-void destroyCbContext(CB_CONTEXT *cbContext)
-{
+void destroyCbContext(CB_CONTEXT *cbContext) {
     pthread_cond_destroy(&cbContext->cv);
     pthread_mutex_destroy(&cbContext->mutex);
-    free(cbContext->buffer);
+    free(cbContext->levels);
     gpu_fft_release(cbContext->fft);
     mbox_close(cbContext->mb);
 }
 
-void processBuffer(CB_CONTEXT *cbContext)
-{
-    // apply blackmanHarris
-    for (int i = 0; i < FFT_SIZE; i++) {
-        double bhtmp1 = (double)(2 * 3.1415 * i / FFT_SIZE);
-        double bhtmp2 = (double)(0.35875 - (0.48829*cos(bhtmp1)) + (0.14128 * cos(2*bhtmp1)) - (0.01168*cos(3*bhtmp1)));
-        cbContext->fft->in[i].re = cbContext->buffer[i].re;// * bhtmp2;                 
-        cbContext->fft->in[i].im = cbContext->buffer[i].im;// * bhtmp2;
+void processFft(CB_CONTEXT *cbContext) {
+    // apply Blackman-Harris window?
+    if (cbContext->bhWindow) {
+        for (int i = 0; i < fftSize; i++) {
+            double bhtmp1 = (double)(2 * 3.1415 * i) / fftSize;
+            double bhtmp2 = (double)(0.35875 - (0.48829*cos(bhtmp1)) + (0.14128 * cos(2*bhtmp1)) - (0.01168*cos(3*bhtmp1)));
+            cbContext->fft->in[i].re *= bhtmp2;                 
+            cbContext->fft->in[i].im *= bhtmp2;
+        }
     }
     
+    // ask the GPU to compute the FFT
     gpu_fft_execute(cbContext->fft);
     
-    //re-order the FFT output.
+    // re-order the FFT output
     int j = 0;
-    for (int i = FFT_SIZE / 2; i < FFT_SIZE; i++) {
+    for (int i = fftSize / 2; i < fftSize; i++) {
         cbContext->levels[j++] = MAGNITUDE(cbContext->fft->out[i]);
     }
-    for (int i = 0; i < FFT_SIZE / 2; i++) {
+    for (int i = 0; i < fftSize / 2; i++) {
         cbContext->levels[j++] = MAGNITUDE(cbContext->fft->out[i]);
     }
-
-    // notify waiter on the condition variable if callback says to exit
-    pthread_mutex_lock(&cbContext->mutex);
-    cbContext->do_exit = cbContext->fn(cbContext->levels);
-    if (cbContext->do_exit) pthread_cond_signal(&cbContext->cv);
-    pthread_mutex_unlock(&cbContext->mutex);
 }
 
-void gainCallback(unsigned int gRdB, unsigned int lnaGRdB, void *cbContext)
-{
+void gainCallback(unsigned int gRdB, unsigned int lnaGRdB, void *cbContext) {
     fprintf(stderr, "gainCallback: gRdB=%u, lnaGRdB=%u\n", gRdB, lnaGRdB);
 }
 
 void streamCallback(short *xi, short *xq, unsigned int firstSampleNum,
     int grChanged, int rfChanged, int fsChanged, unsigned int numSamples,
-    unsigned int reset, void *_cbContext)
-{
+    unsigned int reset, void *_cbContext) {
     CB_CONTEXT *cbContext = (CB_CONTEXT *)_cbContext;
 
+    //fprintf(stderr, "firstSampleNum=%d grChanged=%d rfChanged=%d fsChanged=%d reset=%d\n", firstSampleNum, grChanged, rfChanged, fsChanged, reset);
+
+    if (cbContext->action == PlayLib_EXIT) return;
+
     for (int i = 0; i < numSamples; i++) {
-        cbContext->buffer[cbContext->pos].re = xi[i];
-        cbContext->buffer[cbContext->pos].im = xq[i];
-        if (++cbContext->pos == FFT_SIZE) {
-            processBuffer(cbContext);
+        cbContext->fft->in[cbContext->pos].re = xi[i];
+        cbContext->fft->in[cbContext->pos].im = xq[i];
+        if (++cbContext->pos == fftSize) {
             cbContext->pos = 0;
+            processFft(cbContext);
+
+            mir_sdr_GetCurrentGain(&cbContext->gains);
+
+            // notify waiter on the condition variable if callback says to exit
+            pthread_mutex_lock(&cbContext->mutex);
+
+            cbContext->action = cbContext->fn(&cbContext->gains, cbContext->levels);
+
+            if (cbContext->action == PlayLib_REINIT) {
+                SDR_CONFIG *sdr = cbContext->sdr;
+                cbContext->init_r = mir_sdr_Reinit(&sdr->gRdB, sdr->fsMHz, sdr->rfMHz,
+                    sdr->bwType, sdr->ifType, mir_sdr_LO_Undefined, sdr->lnaState, &cbContext->gRdBsystem,
+                    sdr->setGrMode, &cbContext->samplesPerPacket, mir_sdr_CHANGE_RF_FREQ);
+            } else if (cbContext->action == PlayLib_EXIT) {
+                pthread_cond_signal(&cbContext->cv);
+            }
+
+            pthread_mutex_unlock(&cbContext->mutex);
         }
     }
-
-    mir_sdr_GainValuesT gains;
-    mir_sdr_GetCurrentGain(&gains);
-
-    mir_sdr_BandT band;
-    int gRdB = -SET_POINT;
-    int LNAstate = RSP_LNA;
-    int gRdBsystem;
-    mir_sdr_GetGrByFreq(cbContext->sdr->rfMHz, &band, &gRdB, LNAstate, &gRdBsystem, mir_sdr_USE_SET_GR_ALT_MODE);
-
-    fprintf(stderr, "firstSampleNum=%d grChanged=%d rfChanged=%d fsChanged=%d reset=%d gain=%f\n", firstSampleNum, grChanged, rfChanged, fsChanged, reset, gains.curr);
-    fprintf(stderr, "band=%d gRdB=%d gRdBsystem=%d\n", band, gRdB, gRdBsystem);
-
-    if (grChanged > 0) fprintf(stderr, "==== gain reduction changed\n");
-    if (rfChanged > 0) fprintf(stderr, "---- frequency changed\n");
-
-    if (firstSampleNum > 12819746 && ! cbContext->changed) {
-        cbContext->changed = true;
-        SDR_CONFIG *sdr = cbContext->sdr;
-        sdr->rfMHz += 2;
-        int gRdBsystem;
-        int samplesPerPacket;
-        int r = mir_sdr_Reinit(&sdr->gRdB, sdr->fsMHz, sdr->rfMHz,
-            sdr->bwType, sdr->ifType, mir_sdr_LO_Undefined, sdr->LNAstate, &gRdBsystem,
-            sdr->setGrMode, &samplesPerPacket, mir_sdr_CHANGE_RF_FREQ) == mir_sdr_Success ? 0 : 1;
-        //fprintf(stderr, "freq change? %d\n", mir_sdr_SetRf(2e6, 0, 0));
-        fprintf(stderr, "freq change? %d     gRdBsystem=%d\n", r, gRdBsystem);
-    }
 }
-
-/*18 81
-21 78
-21 78
-24 75
-25 74
-27 72
-30 69
-30 69
-36 63
-43 56
-50 49
-57 42
-64 44 ?
-70 38 ?*/
-
 
 // initialise SDRPlay device - return -1 on error, device model (>=0) on success
 int initDevice(int deviceArg, int antenna) {
@@ -231,8 +209,6 @@ int initDevice(int deviceArg, int antenna) {
     
     int devModel = devices[device].hwVer;
 
-    mir_sdr_SetPpm(PPM_OFFSET);
-
     if (devModel == 2) {
         if (antenna == 0) {
             mir_sdr_RSPII_AntennaControl(mir_sdr_RSPII_ANTENNA_A);
@@ -246,16 +222,9 @@ int initDevice(int deviceArg, int antenna) {
     return devModel;
 }
 
-unsigned int fft_size() {
-    return FFT_SIZE;
-}
-
-// start a streaming thread, calling the callback; wait for it to complete. return number of samples per packet
-int sdr_main(int antenna, int gainR, int bwType, int device, double rfMHz, double fsMHz, CallbackFn callback, int verbose) {
-    int gRdBsystem;
-    int samplesPerPacket;
-
-    if (verbose > 0) {
+// start a streaming thread, calling the callback; wait for it to complete
+int sdr_main(int antenna, int device, SDR_CONFIG *sdr, bool bhWindow, CallbackFn callback, bool verbose) {
+    if (verbose) {
         mir_sdr_DebugEnable(1);
     }
 
@@ -264,28 +233,18 @@ int sdr_main(int antenna, int gainR, int bwType, int device, double rfMHz, doubl
         return -1;
     }
 
-    //FIXME use this as input argument type, initialised therefore in Python
-    SDR_CONFIG sdr;
-    sdr.gRdB = gainR;
-    sdr.fsMHz = fsMHz;
-    sdr.rfMHz = rfMHz;
-    sdr.bwType = (mir_sdr_Bw_MHzT)bwType;
-    sdr.ifType = (mir_sdr_If_kHzT)IF_KHZ;
-    sdr.LNAstate = RSP_LNA;
-    sdr.setGrMode = mir_sdr_USE_SET_GR_ALT_MODE;
+    mir_sdr_SetPpm(sdr->ppmOffset);
 
     CB_CONTEXT cbContext;
-    int r = initCbContext(&cbContext, &sdr, callback);
+    int r = initCbContext(&cbContext, sdr, bhWindow, callback);
     if (r == 0) {
-        r = mir_sdr_StreamInit(&sdr.gRdB, sdr.fsMHz, sdr.rfMHz,
-            sdr.bwType, sdr.ifType, sdr.LNAstate, &gRdBsystem,
-            sdr.setGrMode, &samplesPerPacket, streamCallback,
-            gainCallback, &cbContext) == mir_sdr_Success ? 0 : 1;
+        cbContext.init_r = mir_sdr_StreamInit(&sdr->gRdB, sdr->fsMHz, sdr->rfMHz,
+            sdr->bwType, sdr->ifType, sdr->lnaState, &cbContext.gRdBsystem,
+            sdr->setGrMode, &cbContext.samplesPerPacket, streamCallback,
+            gainCallback, &cbContext);
 
-        if (r == 0) {
-            fprintf(stderr, "gRdBsystem=%d\n", gRdBsystem);
-
-            mir_sdr_AgcControl(AGC_CONTROL, SET_POINT, 0, 0, 0, 0, sdr.LNAstate);
+        if (cbContext.init_r == mir_sdr_Success) {
+            mir_sdr_AgcControl(sdr->agcControl, sdr->setPoint_dBfs, 0, 0, 0, 0, sdr->lnaState);
 
             if (devModel == 2) {
                 mir_sdr_RSPII_ExternalReferenceControl(0);
@@ -294,7 +253,7 @@ int sdr_main(int antenna, int gainR, int bwType, int device, double rfMHz, doubl
             }
 
             pthread_mutex_lock(&cbContext.mutex);
-            while (! cbContext.do_exit) {
+            while (cbContext.action != PlayLib_EXIT) {
                 pthread_cond_wait(&cbContext.cv, &cbContext.mutex);
             }
             pthread_mutex_unlock(&cbContext.mutex);
@@ -310,5 +269,5 @@ int sdr_main(int antenna, int gainR, int bwType, int device, double rfMHz, doubl
 
     mir_sdr_ReleaseDeviceIdx();
 
-    return r == 0 ? samplesPerPacket : -r;
+    return r;
 }

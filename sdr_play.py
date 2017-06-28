@@ -1,50 +1,94 @@
 import sys
 import time
 import math
+import traceback
 from ctypes import *
 
-# int sdr_main(int antenna, int gainR, int bwType, int device, double rfMHz, double fsMHz, CallbackFn callback, int verbose)
-# typedef int (*CallbackFn)(double *levels)
+class SdrConfig(Structure):
+    _fields_ = [('gRdB', c_int),
+                ('fsMHz', c_double),
+                ('rfMHz', c_double), 
+                ('bwType', c_int),
+                ('ifType', c_int),
+                ('ppmOffset', c_double),
+                ('setGrMode', c_int),
+                ('agcControl', c_int),
+                ('setPoint_dBfs', c_int),
+                ('lnaState', c_int)]
+
+class GainValues(Structure):
+    _fields_ = [('curr', c_float), ('max', c_float), ('min', c_float)]
+
+CallbackFunc = CFUNCTYPE(c_int, POINTER(GainValues), POINTER(c_double))
+
+Callback_Continue = 0
+Callback_Reinit = 1
+Callback_Exit = 2
+
+_lib = cdll.LoadLibrary('libplaysdr.so')
+_lib.sdr_main.argtypes = c_int, c_int, POINTER(SdrConfig), c_bool, CallbackFunc, c_bool
+_lib.sdr_main.restype = c_int
+
+FftSize = c_uint.in_dll(_lib, 'fftSize').value
+
 
 class SdrPlay(object):
-    def __init__(self, antenna, gainR, bwkHz, deviceArg, frequency, samp_rate, verbose):
-        self.lib = cdll.LoadLibrary('libplaysdr.so')
-        self.lib.fft_size.restype = c_uint
-        self.CallbackFunc = CFUNCTYPE(c_int, POINTER(c_double))
-        self.lib.sdr_main.argtypes = c_int, c_int, c_int, c_int, c_double, c_double, self.CallbackFunc, c_int
-        self.lib.sdr_main.restype = c_int
+    def __init__(self, antenna, gRdB, bwkHz, device, rfMHz, fsMHz, verbose):
         self.antenna = antenna
-        self.gainR = gainR
-        self.bwkHz = bwkHz
-        self.deviceArg = deviceArg
-        self.frequency = frequency
-        self.samp_rate = samp_rate
+        self.device = device
+        self.sdr_config = SdrConfig(gRdB, fsMHz, rfMHz, bwkHz, 0, 0, 1, 1, -30, 0)
         self.verbose = verbose
 
     def main(self, callback):
-        rfMHz = self.frequency / 1e6
-        fsMHz = self.samp_rate / 1e6
-        sampleN = self.lib.sdr_main(self.antenna, self.gainR, self.bwkHz, self.deviceArg, rfMHz, fsMHz, self.CallbackFunc(callback), self.verbose)
+        if _lib.sdr_main(self.antenna, self.device, self.sdr_config, False, CallbackFunc(callback), self.verbose) != 0:
+            pass
 
-    # (float)((frequency - (samp_rate/2)) + (float)(i * (float)(samp_rate/fftSize)))/1e6)
     def iter_freq(self):
-        fftSize = self.lib.fft_size()
-        for i in xrange(fftSize):
-            yield (self.frequency - self.samp_rate / 2.0 + i * self.samp_rate / float(fftSize)) / 1e6
+        for i in xrange(FftSize):
+            yield self.sdr_config.rfMHz - 0.5 * self.sdr_config.fsMHz + i * self.sdr_config.fsMHz / float(FftSize)
 
 t0 = time.time()
+t1 = t0
 
-def callback(levels):
+def callback(gains_p, levels):
+    global t0, t1 
+    action = Callback_Continue
     try:
         v = zip(sdr.iter_freq(), levels)
-        print ','.join(['%f' % (math.log(l), ) for f, l in v[2020:2076]])
-        print >>sys.stderr, max(v, key=lambda x: x[1]), time.time()
-    except BaseException as e:
-        print e
-    finally:
-        return time.time() > t0 + 60
 
-sdr = SdrPlay(0, 70, 8000, 1, 94500000, 10000000, 1 if 'debug' in sys.argv else 0)
+        # channelise
+        width = 0.1
+        v2 = []
+        f0 = 0
+        for f, l in v:
+            if f > f0 + width:
+                if f0 > 0:
+                    v2.append((f_s / n, l_m))
+                f0 = f
+                f_s = 0
+                l_m = 0
+                n = 0
+            n += 1
+            f_s += f
+            if l > l_m:
+                l_m = l
+
+        print ','.join(['%f' % (math.log(l), ) for f, l in v2])
+        gains = gains_p.contents
+        peak = max(v2, key=lambda x: x[1])
+        print >>sys.stderr, 'Peak freq {:.4f}    gain {:d}    level {:.2f}    time {:.2f}'.format(peak[0], int(gains.curr), math.log(peak[1]), time.time() - t0)
+        if time.time() > t1 + 10:
+            action = Callback_Reinit
+            t1 = time.time()
+            sdr.sdr_config.rfMHz += 0.2
+            print >>sys.stderr, "Change frequency", sdr.sdr_config.rfMHz
+    except BaseException as e:
+        traceback.print_exc(sys.stderr)
+        action = Callback_Exit
+    finally:
+        return Callback_Exit if time.time() > t0 + 60 else action
+
+sdr = SdrPlay(0, 30, 8000, 1, 94.5, 10, 'debug' in sys.argv)
 
 #print ','.join([str(f) for f in sdr.iter_freq()])
 
