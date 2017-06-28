@@ -32,6 +32,7 @@
 #include "mirsdrapi-rsp.h"
 
 #define MAGNITUDE(z) sqrt(z.re * z.re + z.im * z.im)
+#define SKIP_N  2
 
 unsigned int fftSize = 4096;
 unsigned int log2_fftSize = 12;
@@ -40,6 +41,9 @@ typedef struct {
     int gRdB;
     double fsMHz;
     double rfMHz;
+    double rfMHz_min;
+    double rfMHz_max;
+    double dfMHz;
     mir_sdr_Bw_MHzT bwType;
     mir_sdr_If_kHzT ifType;
     double ppmOffset;
@@ -47,12 +51,17 @@ typedef struct {
     mir_sdr_AgcControlT agcControl;
     int setPoint_dBfs;
     int lnaState;
+
+    int gRdBsystem;
+    int samplesPerPacket;
+    int init_r;
 } SDR_CONFIG;
 
 typedef enum {
     PlayLib_CONTINUE = 0,
     PlayLib_REINIT   = 1,
-    PlayLib_EXIT     = 2
+    PlayLib_STEPFREQ = 2,
+    PlayLib_EXIT     = 3
 } CallbackReturnT;
 
 typedef CallbackReturnT (*CallbackFn)(mir_sdr_GainValuesT *gains, double *levels);
@@ -61,9 +70,15 @@ typedef struct {
     SDR_CONFIG *sdr;                // pointer to SDR config struct passed in to sdr_main()
     bool bhWindow;                  // whether to apply the Blackman-Harris window
 
+    double next_rfMHz;              // if changing frequency, what we are changing to
+    int skip;
+
     int mb;                         // 'mailbox' handle used by GPU FFT
     struct GPU_FFT *fft;            // input/output for GPU FFT
     unsigned int pos;               // current position into fft->in
+
+    unsigned int gRdB;              // updated by gainCallback()
+    unsigned int lnaGRdB;           // updated by gainCallback()
 
     CallbackFn fn;
     mir_sdr_GainValuesT gains;
@@ -71,10 +86,6 @@ typedef struct {
     double *levels;
     pthread_mutex_t mutex;
     pthread_cond_t cv;
-
-    int gRdBsystem;
-    int samplesPerPacket;
-    int init_r;
 } CB_CONTEXT;
 
 // initialise callback context including RAM for IQ samples
@@ -93,6 +104,8 @@ int initCbContext(CB_CONTEXT *cbContext, SDR_CONFIG *sdr, bool bhWindow, Callbac
     cbContext->sdr = sdr;
     cbContext->bhWindow = bhWindow;
     cbContext->pos = 0;
+    cbContext->gRdB = 0;
+    cbContext->lnaGRdB = 0;
     cbContext->fn = callback;
     cbContext->action = PlayLib_CONTINUE;
     cbContext->levels = calloc(fftSize, sizeof(double));
@@ -134,7 +147,10 @@ void processFft(CB_CONTEXT *cbContext) {
     }
 }
 
-void gainCallback(unsigned int gRdB, unsigned int lnaGRdB, void *cbContext) {
+void gainCallback(unsigned int gRdB, unsigned int lnaGRdB, void *_cbContext) {
+    CB_CONTEXT *cbContext = (CB_CONTEXT *)_cbContext;
+    cbContext->gRdB = gRdB;
+    cbContext->lnaGRdB = lnaGRdB;
     fprintf(stderr, "gainCallback: gRdB=%u, lnaGRdB=%u\n", gRdB, lnaGRdB);
 }
 
@@ -143,15 +159,34 @@ void streamCallback(short *xi, short *xq, unsigned int firstSampleNum,
     unsigned int reset, void *_cbContext) {
     CB_CONTEXT *cbContext = (CB_CONTEXT *)_cbContext;
 
-    //fprintf(stderr, "firstSampleNum=%d grChanged=%d rfChanged=%d fsChanged=%d reset=%d\n", firstSampleNum, grChanged, rfChanged, fsChanged, reset);
-
     if (cbContext->action == PlayLib_EXIT) return;
+
+    if (grChanged > 0 || rfChanged > 0 || fsChanged > 0 || reset > 0) {
+        // if system parameters changed, we can't use currently buffered iq data
+        cbContext->pos = 0;
+    }
+
+    if (rfChanged > 0) {
+        // SDR Play has made a frequency change (after we requested it), so change external config
+        cbContext->sdr->rfMHz = cbContext->next_rfMHz;
+    }
+
+    if (grChanged > 0) {
+        // packets are unreliable after a gain change - skip next few packets
+        cbContext->skip = firstSampleNum + SKIP_N * numSamples;
+    }
+    if (firstSampleNum < cbContext->skip) {
+        //FIXME this doesn't work, because it's the FFT that is the bottle neck; we need to sleep in the caller??
+        return;
+    }
 
     for (int i = 0; i < numSamples; i++) {
         cbContext->fft->in[cbContext->pos].re = xi[i];
         cbContext->fft->in[cbContext->pos].im = xq[i];
+
         if (++cbContext->pos == fftSize) {
             cbContext->pos = 0;
+
             processFft(cbContext);
 
             mir_sdr_GetCurrentGain(&cbContext->gains);
@@ -161,11 +196,19 @@ void streamCallback(short *xi, short *xq, unsigned int firstSampleNum,
 
             cbContext->action = cbContext->fn(&cbContext->gains, cbContext->levels);
 
-            if (cbContext->action == PlayLib_REINIT) {
+            if (cbContext->action == PlayLib_REINIT || cbContext->action == PlayLib_STEPFREQ) {
                 SDR_CONFIG *sdr = cbContext->sdr;
-                cbContext->init_r = mir_sdr_Reinit(&sdr->gRdB, sdr->fsMHz, sdr->rfMHz,
-                    sdr->bwType, sdr->ifType, mir_sdr_LO_Undefined, sdr->lnaState, &cbContext->gRdBsystem,
-                    sdr->setGrMode, &cbContext->samplesPerPacket, mir_sdr_CHANGE_RF_FREQ);
+                cbContext->next_rfMHz = sdr->rfMHz;
+                if (cbContext->action == PlayLib_STEPFREQ) {
+                    cbContext->next_rfMHz += sdr->dfMHz;
+                    if (cbContext->next_rfMHz > sdr->rfMHz_max) {
+                        cbContext->next_rfMHz = sdr->rfMHz_min;
+                    }
+                }
+
+                sdr->init_r = mir_sdr_Reinit(&sdr->gRdB, sdr->fsMHz, cbContext->next_rfMHz,
+                    sdr->bwType, sdr->ifType, mir_sdr_LO_Undefined, sdr->lnaState, &sdr->gRdBsystem,
+                    sdr->setGrMode, &sdr->samplesPerPacket, mir_sdr_CHANGE_RF_FREQ);
             } else if (cbContext->action == PlayLib_EXIT) {
                 pthread_cond_signal(&cbContext->cv);
             }
@@ -238,12 +281,12 @@ int sdr_main(int antenna, int device, SDR_CONFIG *sdr, bool bhWindow, CallbackFn
     CB_CONTEXT cbContext;
     int r = initCbContext(&cbContext, sdr, bhWindow, callback);
     if (r == 0) {
-        cbContext.init_r = mir_sdr_StreamInit(&sdr->gRdB, sdr->fsMHz, sdr->rfMHz,
-            sdr->bwType, sdr->ifType, sdr->lnaState, &cbContext.gRdBsystem,
-            sdr->setGrMode, &cbContext.samplesPerPacket, streamCallback,
+        sdr->init_r = mir_sdr_StreamInit(&sdr->gRdB, sdr->fsMHz, sdr->rfMHz,
+            sdr->bwType, sdr->ifType, sdr->lnaState, &sdr->gRdBsystem,
+            sdr->setGrMode, &sdr->samplesPerPacket, streamCallback,
             gainCallback, &cbContext);
 
-        if (cbContext.init_r == mir_sdr_Success) {
+        if (sdr->init_r == mir_sdr_Success) {
             mir_sdr_AgcControl(sdr->agcControl, sdr->setPoint_dBfs, 0, 0, 0, 0, sdr->lnaState);
 
             if (devModel == 2) {
