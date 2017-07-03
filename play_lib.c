@@ -41,9 +41,6 @@ typedef struct {
     int gRdB;
     double fsMHz;
     double rfMHz;
-    double rfMHz_min;
-    double rfMHz_max;
-    double dfMHz;
     mir_sdr_Bw_MHzT bwType;
     mir_sdr_If_kHzT ifType;
     double ppmOffset;
@@ -55,23 +52,22 @@ typedef struct {
     int gRdBsystem;
     int samplesPerPacket;
     int init_r;
+    bool reinit;
 } SDR_CONFIG;
 
 typedef enum {
     PlayLib_CONTINUE = 0,
     PlayLib_REINIT   = 1,
-    PlayLib_STEPFREQ = 2,
-    PlayLib_EXIT     = 3
+    PlayLib_EXIT     = 2
 } CallbackReturnT;
 
-typedef CallbackReturnT (*CallbackFn)(mir_sdr_GainValuesT *gains, double *levels);
+typedef CallbackReturnT (*CallbackFn)(unsigned int gRdB, unsigned int lnaGRdB, mir_sdr_GainValuesT *gains, double *levels);
 
 typedef struct {
     SDR_CONFIG *sdr;                // pointer to SDR config struct passed in to sdr_main()
     bool bhWindow;                  // whether to apply the Blackman-Harris window
 
-    double next_rfMHz;              // if changing frequency, what we are changing to
-    int skip;
+    int skip;                       // don't call the callback until we get to skip
 
     int mb;                         // 'mailbox' handle used by GPU FFT
     struct GPU_FFT *fft;            // input/output for GPU FFT
@@ -151,33 +147,25 @@ void gainCallback(unsigned int gRdB, unsigned int lnaGRdB, void *_cbContext) {
     CB_CONTEXT *cbContext = (CB_CONTEXT *)_cbContext;
     cbContext->gRdB = gRdB;
     cbContext->lnaGRdB = lnaGRdB;
-    fprintf(stderr, "gainCallback: gRdB=%u, lnaGRdB=%u\n", gRdB, lnaGRdB);
 }
 
 void streamCallback(short *xi, short *xq, unsigned int firstSampleNum,
     int grChanged, int rfChanged, int fsChanged, unsigned int numSamples,
     unsigned int reset, void *_cbContext) {
     CB_CONTEXT *cbContext = (CB_CONTEXT *)_cbContext;
+    SDR_CONFIG *sdr = cbContext->sdr;
 
     if (cbContext->action == PlayLib_EXIT) return;
 
     if (grChanged > 0 || rfChanged > 0 || fsChanged > 0 || reset > 0) {
         // if system parameters changed, we can't use currently buffered iq data
         cbContext->pos = 0;
-    }
-
-    if (rfChanged > 0) {
-        // SDR Play has made a frequency change (after we requested it), so change external config
-        cbContext->sdr->rfMHz = cbContext->next_rfMHz;
+        sdr->reinit = true;
     }
 
     if (grChanged > 0) {
         // packets are unreliable after a gain change - skip next few packets
         cbContext->skip = firstSampleNum + SKIP_N * numSamples;
-    }
-    if (firstSampleNum < cbContext->skip) {
-        //FIXME this doesn't work, because it's the FFT that is the bottle neck; we need to sleep in the caller??
-        return;
     }
 
     for (int i = 0; i < numSamples; i++) {
@@ -189,24 +177,21 @@ void streamCallback(short *xi, short *xq, unsigned int firstSampleNum,
 
             processFft(cbContext);
 
+            if (firstSampleNum < cbContext->skip) {
+                // skip after processing the FFT
+                return;
+            }
+
             mir_sdr_GetCurrentGain(&cbContext->gains);
 
             // notify waiter on the condition variable if callback says to exit
             pthread_mutex_lock(&cbContext->mutex);
 
-            cbContext->action = cbContext->fn(&cbContext->gains, cbContext->levels);
+            cbContext->action = cbContext->fn(cbContext->gRdB, cbContext->lnaGRdB, &cbContext->gains, cbContext->levels);
 
-            if (cbContext->action == PlayLib_REINIT || cbContext->action == PlayLib_STEPFREQ) {
-                SDR_CONFIG *sdr = cbContext->sdr;
-                cbContext->next_rfMHz = sdr->rfMHz;
-                if (cbContext->action == PlayLib_STEPFREQ) {
-                    cbContext->next_rfMHz += sdr->dfMHz;
-                    if (cbContext->next_rfMHz > sdr->rfMHz_max) {
-                        cbContext->next_rfMHz = sdr->rfMHz_min;
-                    }
-                }
-
-                sdr->init_r = mir_sdr_Reinit(&sdr->gRdB, sdr->fsMHz, cbContext->next_rfMHz,
+            if (cbContext->action == PlayLib_REINIT) {
+                sdr->reinit = false;
+                sdr->init_r = mir_sdr_Reinit(&sdr->gRdB, sdr->fsMHz, sdr->rfMHz,
                     sdr->bwType, sdr->ifType, mir_sdr_LO_Undefined, sdr->lnaState, &sdr->gRdBsystem,
                     sdr->setGrMode, &sdr->samplesPerPacket, mir_sdr_CHANGE_RF_FREQ);
             } else if (cbContext->action == PlayLib_EXIT) {
