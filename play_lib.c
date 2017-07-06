@@ -66,6 +66,7 @@ typedef CallbackReturnT (*CallbackFn)(unsigned int gRdB, unsigned int lnaGRdB, m
 typedef struct {
     SDR_CONFIG *sdr;                // pointer to SDR config struct passed in to sdr_main()
     bool bhWindow;                  // whether to apply the Blackman-Harris window
+    int devModel;                   // the dev model determined from the antenna
 
     int skip;                       // don't call the callback until we get to skip
 
@@ -85,7 +86,7 @@ typedef struct {
 } CB_CONTEXT;
 
 // initialise callback context including RAM for IQ samples
-int initCbContext(CB_CONTEXT *cbContext, SDR_CONFIG *sdr, bool bhWindow, CallbackFn callback) {
+int initCbContext(CB_CONTEXT *cbContext, SDR_CONFIG *sdr, bool bhWindow, int devModel, CallbackFn callback) {
     cbContext->mb = mbox_open();
         
     int ret = gpu_fft_prepare(cbContext->mb, log2_fftSize, GPU_FFT_FWD, 1, &cbContext->fft);
@@ -99,6 +100,7 @@ int initCbContext(CB_CONTEXT *cbContext, SDR_CONFIG *sdr, bool bhWindow, Callbac
 
     cbContext->sdr = sdr;
     cbContext->bhWindow = bhWindow;
+    cbContext->devModel = devModel;
     cbContext->pos = 0;
     cbContext->gRdB = 0;
     cbContext->lnaGRdB = 0;
@@ -211,10 +213,14 @@ int initDevice(int deviceArg, int antenna) {
 
     if (antenna < 0 || antenna > 2) {
         fprintf(stderr, "ERROR: antenna value not supported (0 = Ant A, 1 = Ant B, 2 = HiZ)z\n");
-        return 1;
+        return -1;
     }
 
-    mir_sdr_GetDevices(&devices[0], &numDevs, 4);
+    mir_sdr_ErrT r = mir_sdr_GetDevices(&devices[0], &numDevs, 4);
+    if (r != mir_sdr_Success) {
+        fprintf(stderr, "ERROR (%d): Could not get devices\n", r);
+        return -1;
+    }
 
     int devAvail = 0;
     for (int i = 0; i < numDevs; i++) {
@@ -225,16 +231,20 @@ int initDevice(int deviceArg, int antenna) {
 
     if (devAvail == 0) {
         fprintf(stderr, "ERROR: No RSP devices available.\n");
-        return 1;
+        return -1;
     }
 
     if (devices[device].devAvail != 1) {
         fprintf(stderr, "ERROR: RSP selected (%d) is not available.\n", (device + 1));
-        return 1;
+        return -1;
     }
 
-    mir_sdr_SetDeviceIdx(device);
-    
+    r = mir_sdr_SetDeviceIdx(device);
+    if (r != mir_sdr_Success) {
+        fprintf(stderr, "ERROR (%d): Could not set device index\n", r);
+        return -1;
+    }
+
     int devModel = devices[device].hwVer;
 
     if (devModel == 2) {
@@ -250,8 +260,8 @@ int initDevice(int deviceArg, int antenna) {
     return devModel;
 }
 
-// start a streaming thread, calling the callback; wait for it to complete
-int sdr_main(int antenna, int device, SDR_CONFIG *sdr, bool bhWindow, CallbackFn callback, bool verbose) {
+// open SDR Play for streaming data - cbContext is an output
+int sdr_open(int antenna, int device, SDR_CONFIG *sdr, bool bhWindow, CallbackFn callback, bool verbose, CB_CONTEXT **cbContext) {
     if (verbose) {
         mir_sdr_DebugEnable(1);
     }
@@ -261,41 +271,53 @@ int sdr_main(int antenna, int device, SDR_CONFIG *sdr, bool bhWindow, CallbackFn
         return -1;
     }
 
-    mir_sdr_SetPpm(sdr->ppmOffset);
-
-    CB_CONTEXT cbContext;
-    int r = initCbContext(&cbContext, sdr, bhWindow, callback);
-    if (r == 0) {
-        sdr->init_r = mir_sdr_StreamInit(&sdr->gRdB, sdr->fsMHz, sdr->rfMHz,
-            sdr->bwType, sdr->ifType, sdr->lnaState, &sdr->gRdBsystem,
-            sdr->setGrMode, &sdr->samplesPerPacket, streamCallback,
-            gainCallback, &cbContext);
-
-        if (sdr->init_r == mir_sdr_Success) {
-            mir_sdr_AgcControl(sdr->agcControl, sdr->setPoint_dBfs, 0, 0, 0, 0, sdr->lnaState);
-
-            if (devModel == 2) {
-                mir_sdr_RSPII_ExternalReferenceControl(0);
-                mir_sdr_RSPII_RfNotchEnable(0);
-                mir_sdr_RSPII_BiasTControl(0);
-            }
-
-            pthread_mutex_lock(&cbContext.mutex);
-            while (cbContext.action != PlayLib_EXIT) {
-                pthread_cond_wait(&cbContext.cv, &cbContext.mutex);
-            }
-            pthread_mutex_unlock(&cbContext.mutex);
-
-            mir_sdr_StreamUninit();
-        } else {
-            fprintf(stderr, "Failed to start SDRplay RSP device.\n");
-            fprintf(stderr, "Use verbose mode to see the issue.\n");
-        }
-
-        destroyCbContext(&cbContext);
+    mir_sdr_ErrT r = mir_sdr_SetPpm(sdr->ppmOffset);
+    if (r != mir_sdr_Success) {
+        fprintf(stderr, "ERROR (%d): Could not set ppm\n", r);
+        return -1;
     }
 
-    mir_sdr_ReleaseDeviceIdx();
+    *cbContext = (CB_CONTEXT *)malloc(sizeof(CB_CONTEXT));
+    int s = initCbContext(*cbContext, sdr, bhWindow, devModel, callback);
+    if (s != 0) {
+        free(*cbContext);
+    }
 
     return r;
+}
+
+// start a streaming thread, calling the callback; wait for it to complete
+void sdr_main(CB_CONTEXT *cbContext) {
+    SDR_CONFIG *sdr = cbContext->sdr;
+    sdr->init_r = mir_sdr_StreamInit(&sdr->gRdB, sdr->fsMHz, sdr->rfMHz,
+        sdr->bwType, sdr->ifType, sdr->lnaState, &sdr->gRdBsystem,
+        sdr->setGrMode, &sdr->samplesPerPacket, streamCallback,
+        gainCallback, cbContext);
+
+    if (sdr->init_r == mir_sdr_Success) {
+        mir_sdr_AgcControl(sdr->agcControl, sdr->setPoint_dBfs, 0, 0, 0, 0, sdr->lnaState);
+
+        if (cbContext->devModel == 2) {
+            mir_sdr_RSPII_ExternalReferenceControl(0);
+            mir_sdr_RSPII_RfNotchEnable(0);
+            mir_sdr_RSPII_BiasTControl(0);
+        }
+
+        pthread_mutex_lock(&cbContext->mutex);
+        while (cbContext->action != PlayLib_EXIT) {
+            pthread_cond_wait(&cbContext->cv, &cbContext->mutex);
+        }
+        pthread_mutex_unlock(&cbContext->mutex);
+
+        mir_sdr_StreamUninit();
+    } else {
+        fprintf(stderr, "Failed to start SDRplay RSP device.\n");
+        fprintf(stderr, "Use verbose mode to see the issue.\n");
+    }
+}
+
+// close SDR Play: free resources, let go of device, etc.
+void sdr_close(CB_CONTEXT *cbContext) {
+    destroyCbContext(cbContext);
+    mir_sdr_ReleaseDeviceIdx();
 }

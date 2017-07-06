@@ -11,7 +11,7 @@ all: $(PROGNAME) $(LIBNAME)
 	$(CC) $(CFLAGS) -c $<
 
 $(PROGNAME): play_sdr.o $(OBJ)
-	$(CC) -g -o $(PROGNAME) play_sdr.o $(OBJ) $(LDFLAGS) $(LDLIBS)
+	$(CC) -o $(PROGNAME) play_sdr.o $(OBJ) $(LDFLAGS) $(LDLIBS)
 
 $(LIBNAME): play_lib.o $(OBJ)
 	$(CC) -shared -o $(LIBNAME) $(OBJ) play_lib.o $(LDFLAGS) $(LDLIBS)
