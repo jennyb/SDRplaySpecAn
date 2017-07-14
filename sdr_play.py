@@ -1,5 +1,6 @@
 import sys
 import time
+import datetime
 import math
 from itertools import islice
 import traceback
@@ -46,6 +47,9 @@ _lib.sdr_close.restype = None
 
 FftSize = c_uint.in_dll(_lib, 'fftSize').value
 
+def debug(f_str, *args):
+    print >>sys.stderr, str(datetime.datetime.now()), f_str.format(*args)
+
 class SdrPlay(object):
     """ API for spectrum scanning with an SDR Play device.
 
@@ -66,22 +70,26 @@ class SdrPlay(object):
         self.sdr_config = SdrConfig(gRdB, fsMHz, rfMHz, bwkHz, 0, 0, 1, 1, -30, 0, True)
         self.cwMHz = cwMHz
         self.verbose = verbose
+        self.context_p = c_void_p()
 
-    def main(self, callback):
+    def open(self, callback):
         def _callback(gRdB, lnaGRdB, gains_p, levels_p):
             if self.sdr_config.init_r != 0:
-                print >>sys.stderr, "Bad Reinit({})".format(self.sdr_config.init_r)
+                debug("Bad Reinit({})", self.sdr_config.init_r)
                 return Callback_Exit
             gains = gains_p.contents
             levels = [log(l) for l in list(islice(levels_p, FftSize))]
             if self.cwMHz is not None:
                 levels = self._channelise(levels)
             return callback(self.sdr_config.reinit, [gRdB, lnaGRdB, gains.curr, gains.max, gains.min], levels)
-        p = c_void_p()
-        r = _lib.sdr_open(self.antenna, self.device, self.sdr_config, False, CallbackFunc(_callback), self.verbose, p)
-        if r == 0:
-            _lib.sdr_main(p)
-        _lib.sdr_close(p)
+        self._callback = _callback # we need to keep a reference to _callback otherwise it gets GC
+        return _lib.sdr_open(self.antenna, self.device, self.sdr_config, False, CallbackFunc(_callback), self.verbose, self.context_p)
+
+    def main(self):
+        _lib.sdr_main(self.context_p)
+
+    def close(self):
+        _lib.sdr_close(self.context_p)
 
     def n_channels(self):
         if self.cwMHz is None:
@@ -108,12 +116,12 @@ class SdrPlay(object):
         levels_in = iter(levels)
         levels_out = []
         level_max = 0
-        f0 = self.sdr_config.rfMHz - math.ceil(0.5 * self.sdr_config.fsMHz / self.cwMHz) * self.cwMHz - 0.5 * self.cwMHz
+        f0 = -0.5 * self.cwMHz
         for i in xrange(FftSize):
-            freq = self.sdr_config.rfMHz - 0.5 * self.sdr_config.fsMHz + i * self.sdr_config.fsMHz / float(FftSize)
+            freq = i * self.sdr_config.fsMHz / float(FftSize)
             if freq >= f0 + self.cwMHz:
                 levels_out.append(level_max)
-                f0 = freq
+                f0 += self.cwMHz
                 level_max = 0
             level = levels_in.next()
             if level > level_max:
@@ -128,20 +136,20 @@ if __name__ == "__main__":
         action = Callback_Continue
         try:
             if time.time() > t0 + 60.0:
-                print >>sys.stderr, "Time out"
+                debug("Time out")
                 action = Callback_Exit
 
             elif sdr.sdr_config.reinit: # True at start and when a requested frequency change has occurred
                 rf = sdr.sdr_config.rfMHz
                 sdr.sdr_config.rfMHz += 5.0
                 if sdr.sdr_config.rfMHz > 108.0 + 5.0:
-                    print >>sys.stderr, "Exit"
+                    debug("Exit")
                     action = Callback_Exit
                 else:
-                    print >>sys.stderr, "Change frequency"
+                    debug("Change frequency")
                     action = Callback_Reinit
 
-            print >>sys.stderr, sdr.sdr_config.init_r, rf, len(levels), max(levels)
+            debug("{} {} {} {}", sdr.sdr_config.init_r, rf, len(levels), max(levels))
             #print ','.join([str(rf)] + [str(l) for l in levels])
         except BaseException as e:
             traceback.print_exc(sys.stderr)
@@ -150,5 +158,7 @@ if __name__ == "__main__":
             return action
 
     sdr = SdrPlay(rfMHz=88.0, cwMHz=1.0, verbose='debug' in sys.argv)
-    sdr.main(callback)
+    if sdr.open(callback) == 0:
+        sdr.main()
+    sdr.close()
 
