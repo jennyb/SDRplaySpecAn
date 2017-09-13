@@ -4,7 +4,6 @@ This project is an amalgamation of the SDRplay example code that produces IQ dat
 
 To install the python package 'sdrplay':
 
-0. Install the MIR SDR play libraries and headers
 1. Build the library and install (sudo make install)
 2. Install the Python package using pip (sudo -H pip install -e .)
  
