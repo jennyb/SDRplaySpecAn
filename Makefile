@@ -1,5 +1,5 @@
 CFLAGS?=-O2 -g -Wall -fpic -std=gnu99
-LDLIBS+= -lpthread -lm -lmirsdrapi-rsp -lrt -ldl
+LDLIBS+= -L. -lpthread -lm -lmirsdrapi-rsp -lrt -ldl
 CC?=gcc
 PROGNAME=play_sdr
 LIBNAME=libplaysdr.so
