@@ -18,6 +18,7 @@ $(LIBNAME): play_lib.o $(OBJ)
 
 install: $(LIBNAME)
 	cp $(LIBNAME) /usr/lib
+	cp libmirsdrapi-rsp.so.2.10 /usr/lib
 	ldconfig
 
 .PHONY: clean
